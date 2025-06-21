@@ -7,9 +7,8 @@ from airflow.operators.python import PythonOperator
 import logging  
 from airflow.providers.amazon.aws.sensors.sqs import SqsSensor
 from airflow.decorators import task
-import json
-import boto3
-import pandas as pd
+from airflow.exceptions import AirflowSkipException
+
 
 default_args = {
     'owner': 'Essuman',
@@ -24,7 +23,8 @@ with DAG(
     default_args=default_args,
     description='A simple data pipeline using Glue',
     start_date=datetime(2024, 6, 21), # Set to None to avoid scheduling issues
-    schedule="@daily",  # Adjust as needed
+    # schedule="@daily",  # Adjust as needed
+    schedule="*/10 * * * *",  # Set to None to avoid scheduling issues
     max_active_runs=1,
     catchup=False,
     tags=['data_pipeline', 'glue']
@@ -46,7 +46,7 @@ with DAG(
         response = sqs.receive_message(
             QueueUrl=sqs_url,
             MaxNumberOfMessages=10,
-            WaitTimeSeconds=5
+            WaitTimeSeconds=20
         )
 
         messages = response.get('Messages', [])
@@ -75,26 +75,96 @@ with DAG(
     
     @task
     def validate_data(s3_obj: dict):
+        import pandas as pd
         bucket = s3_obj['bucket']
         key = s3_obj['key']
-        logging.info(f"🔍 Validating file: s3://{bucket}/{key}")
+        s3_object_path = f"s3://{bucket}/{key}"
+        logging.info(f"Validating file: s3://{s3_object_path}")
+        try:
+            reader = pd.read_csv(s3_object_path, chunksize=500)
+            first_chunk = next(reader)
+
+            required_columns = {"user_id", "track_id", "listen_time"}
+            if not required_columns.issubset(set(first_chunk.columns)):
+                raise ValueError(f"Missing required columns in {s3_object_path}")
+
+            s3_obj['validated'] = True  # Mark as validated
+            return s3_obj
+        except Exception as e:
+            logging.error(f"Validation failed for {key} in bucket {bucket}: {e}")
+            s3_obj['validated'] = False
 
         return s3_obj 
     
     @task
     def process_data(extracted_data: dict):
+        import pandas as pd
         bucket = extracted_data['bucket']
         key = extracted_data['key']
+        is_valid = extracted_data['validated']
+        s3_object_path = f"s3://{bucket}/{key}"
+        file_name = key.split('/')[-1]
+        s3_processed_path = f"s3://{bucket}/processed/{file_name}"  # Save processed data in a new location
+        if not is_valid:
+            logging.error(f"Data validation failed for {key} in bucket {bucket}. Skipping processing.")
+            raise AirflowSkipException(f"Validation failed for {key}")
+            
         logging.info(f"Processing data from bucket: {bucket}, key: {key}")
+        try:
+            df = pd.read_csv(s3_object_path, nrows=20)
+            df.to_csv(s3_processed_path, index=False)
+            return {
+                'bucket': bucket,
+                'key': "processed/" + file_name,
+                'processed': True  # Placeholder for processed data
+            }
+        except Exception as e:
+            logging.error(f"Processing failed for {key} in bucket {bucket}: {e}")
+            raise
 
-        return {
-            'bucket': bucket,
-            'key': key,
-            'processed': True  # Placeholder for processed data
-        }
 
-    
+    @task
+    def load_to_dynamo(processed_data: dict):
+        bucket = processed_data['bucket']
+        key = processed_data['key']
+        is_processed = processed_data.get('processed', False)
+        table_name = "music_streaming_records"
+        try:
 
+            logging.info(f"Loading file from s3://{bucket}/{key} into DynamoDB {table_name}")
+            if not is_processed:
+                raise AirflowSkipException(f"Processing not completed for {key}")
+        except Exception as e:
+            logging.error(f"Failed to load data into DynamoDB: {e}")
+            raise
+            
+
+    @task
+    def archive_data(source_data: dict):
+        import boto3
+        source_bucket = source_data['bucket']
+        source_key = source_data['key']
+        
+        archive_bucket = "music-streaming-archive.amalitech-gke"
+        archive_key = f"archived/{source_key}"
+
+        logging.info(f"📦 Archiving s3://{source_bucket}/{source_key} to s3://{archive_bucket}/{archive_key}")
+        s3 = boto3.client('s3')
+        try:
+            # Step 1: Copy
+            s3.copy_object(
+                Bucket=archive_bucket,
+                CopySource={'Bucket': source_bucket, 'Key': source_key},
+                Key=archive_key
+            )
+
+            # Step 2: Delete original
+            s3.delete_object(Bucket=source_bucket, Key=source_key)
+            logging.info(f"Successfully archived {source_key} to {archive_bucket}/{archive_key}")
+        
+        except Exception as e:
+            logging.error(f"Move failed: {e}")
+            raise
 
     end = PythonOperator(
         task_id='end',
@@ -103,40 +173,6 @@ with DAG(
     )
 
 
-    @task
-    def load_to_dynamo(processed_data: dict):
-        bucket = processed_data['bucket']
-        key = processed_data['key']
-        table_name = "music_streaming_records"
-        logging.info(f"Loading file from s3://{bucket}/{key} into DynamoDB {table_name}")
-
-        
-
-    @task
-    def archive_data(source_data: dict):
-        source_bucket = source_data['bucket']
-        source_key = source_data['key']
-        
-        archive_bucket = "music-streaming-archive"
-        archive_key = f"archived/{source_key}"  # Preserve original path
-
-        logging.info(f"📦 Archiving s3://{source_bucket}/{source_key} to s3://{archive_bucket}/{archive_key}")
-        # s3 = boto3.client('s3')
-        # try:
-        # # Step 1: Copy
-        #     s3.copy_object(
-        #         Bucket=archive_bucket,
-        #         CopySource={'Bucket': source_bucket, 'Key': source_key},
-        #         Key=archive_key
-        #     )
-
-        #     # Step 2: Delete original
-        #     s3.delete_object(Bucket=source_bucket, Key=source_key)
-        #     logging.info(f"Successfully archived {source_key} to {archive_bucket}/{archive_key}")
-        
-        # except Exception as e:
-        #     logging.error(f"Move failed: {e}")
-        #     raise
 
     extract_data = fetch_sqs_messages()
     validated_data = validate_data.expand(s3_obj=extract_data)
