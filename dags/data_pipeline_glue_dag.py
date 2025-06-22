@@ -8,6 +8,8 @@ import logging
 from airflow.providers.amazon.aws.sensors.sqs import SqsSensor
 from airflow.decorators import task
 from airflow.exceptions import AirflowSkipException
+from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
+# from airflow.providers.docker.operators.docker import DockerOperator
 
 
 default_args = {
@@ -24,7 +26,7 @@ with DAG(
     description='A simple data pipeline using Glue',
     start_date=datetime(2024, 6, 21), # Set to None to avoid scheduling issues
     # schedule="@daily",  # Adjust as needed
-    schedule="*/10 * * * *",  # Set to None to avoid scheduling issues
+    schedule="@daily",  # Set to None to avoid scheduling issues
     max_active_runs=1,
     catchup=False,
     tags=['data_pipeline', 'glue']
@@ -64,7 +66,6 @@ with DAG(
                         "key": record["s3"]["object"]["key"]
                     })
 
-            # Optionally delete message after reading
             sqs.delete_message(
                 QueueUrl=sqs_url,
                 ReceiptHandle=msg['ReceiptHandle']
@@ -95,45 +96,92 @@ with DAG(
             s3_obj['validated'] = False
 
         return s3_obj 
+    @task
+    def prepare_glue_job_tranformation_args(validated_files: list[dict]):
+        ts = datetime.now().strftime("%Y%m%d%H%M%S")
+
+        glue_args = []
+
+        for file in validated_files:
+            if file.get('validated'):
+                input_path = f"s3://{file['bucket']}/{file['key']}"
+                output_key = f"processed/{file['key'].replace('/', '_')}{ts}"
+                output_path = f"s3://{file['bucket']}/{output_key}"
+                glue_args.append({
+                    "script_args": {
+                    "--input_path": input_path,
+                    "--output_path": output_path,
+                    "--bucket": file['bucket'],
+                    "--key": file['key'],
+                    "--output_key": output_key
+                    }
+                })
+        if not glue_args:
+            logging.warning("No validated files found for Glue job arguments.")
+            return []
+        return glue_args
     
     @task
-    def process_data(extracted_data: dict):
-        import pandas as pd
-        bucket = extracted_data['bucket']
-        key = extracted_data['key']
-        is_valid = extracted_data['validated']
-        s3_object_path = f"s3://{bucket}/{key}"
-        file_name = key.split('/')[-1]
-        s3_processed_path = f"s3://{bucket}/processed/{file_name}"  # Save processed data in a new location
-        if not is_valid:
-            logging.error(f"Data validation failed for {key} in bucket {bucket}. Skipping processing.")
-            raise AirflowSkipException(f"Validation failed for {key}")
-            
-        logging.info(f"Processing data from bucket: {bucket}, key: {key}")
-        try:
-            df = pd.read_csv(s3_object_path, nrows=20)
-            df.to_csv(s3_processed_path, index=False)
-            return {
-                'bucket': bucket,
-                'key': "processed/" + file_name,
-                'processed': True  # Placeholder for processed data
-            }
-        except Exception as e:
-            logging.error(f"Processing failed for {key} in bucket {bucket}: {e}")
-            raise
+    def prepare_glue_job_kpi_args(glue_job_tranformation_args: list[dict]):
+        ts = datetime.now().strftime("%Y%m%d%H%M%S")
+
+        glue_args = []
+
+        for file in glue_job_tranformation_args:
+            input_path = file['script_args']['--output_path']
+            output_key = f"presentation/{file['script_args']['--output_key']}{ts}"
+            output_path = f"s3://{file['script_args']['--bucket']}/{output_key}"
+            glue_args.append({
+                "script_args": {
+                    "--input_path": input_path,
+                    "--output_path": output_path,
+                    "--bucket": file['script_args']['--bucket'],
+                    "--key": file['script_args']['--key'],
+                    "--output_key": output_key
+                }
+            })
+        if not glue_args:
+            logging.warning("No Glue job arguments found for KPI calculation.")
+            return []
+        return glue_args
+    
+    @task
+    def prepare_load_to_dynamodb_args(glue_job_kpi_args: list[dict]):
+        
+
+        glue_args = []
+
+        for file in glue_job_kpi_args:
+            input_path = file['script_args']['--output_path']
+            genre_stats_input_path = f"{input_path}/genre_stats"
+            top_songs_per_genre_input_path = f"{input_path}/top_songs_per_genre"
+            genre_stats_table_name = "genre_stats"
+            top_songs_table_name = "top_songs_per_genre"
+            glue_args.append({
+                "genre_stats": {
+                    "input_path": genre_stats_input_path,
+                    "table_name": genre_stats_table_name
+                },
+                "top_songs_per_genre": {
+                    "input_path": top_songs_per_genre_input_path,
+                    "table_name": top_songs_table_name
+                }
+            })
+        if not glue_args:
+            logging.warning("No Glue job arguments found for KPI calculation.")
+            return []
+        return glue_args
 
 
     @task
-    def load_to_dynamo(processed_data: dict):
-        bucket = processed_data['bucket']
-        key = processed_data['key']
-        is_processed = processed_data.get('processed', False)
-        table_name = "music_streaming_records"
+    def load_to_dynamo(job_kpi_args: dict):
+        genre_stat = job_kpi_args['genre_stats']
+        top_songs_per_genre = job_kpi_args['top_songs_per_genre']
+
         try:
 
-            logging.info(f"Loading file from s3://{bucket}/{key} into DynamoDB {table_name}")
-            if not is_processed:
-                raise AirflowSkipException(f"Processing not completed for {key}")
+            logging.info(f"Loading file from {genre_stat["input_path"]} into DynamoDB {genre_stat["table_name"]}")
+            logging.info(f"Loading file from {top_songs_per_genre["input_path"]} into DynamoDB {top_songs_per_genre["table_name"]}")
         except Exception as e:
             logging.error(f"Failed to load data into DynamoDB: {e}")
             raise
@@ -164,7 +212,7 @@ with DAG(
         
         except Exception as e:
             logging.error(f"Move failed: {e}")
-            raise
+            raise AirflowSkipException(f"Archive failed: {e}")
 
     end = PythonOperator(
         task_id='end',
@@ -176,12 +224,31 @@ with DAG(
 
     extract_data = fetch_sqs_messages()
     validated_data = validate_data.expand(s3_obj=extract_data)
-    processed_data = process_data.expand(extracted_data=validated_data)
-    load_to_dynamo = load_to_dynamo.expand(processed_data=processed_data)
-    archive_data = archive_data.expand(source_data=validated_data)  
+    glue_job_args = prepare_glue_job_tranformation_args(validated_data)
 
+
+    glue_jobs = GlueJobOperator.partial(
+    task_id="run_glue_transformation_job",
+    job_name="transformation_job",
+    region_name="eu-north-1"
+    ).expand_kwargs(glue_job_args)
+
+
+    glue_job_kpi_args = prepare_glue_job_kpi_args(glue_job_args)
+    glue_jobs_kpi = GlueJobOperator.partial(
+        task_id="run_glue_kpi_job",
+        job_name="kpi_implementation_job",
+        region_name="eu-north-1"
+    ).expand_kwargs(glue_job_kpi_args)
+
+    load_to_dynamo_kpi_args = prepare_load_to_dynamodb_args(glue_job_kpi_args)
+    load_to_dynamo = load_to_dynamo.expand(job_kpi_args=load_to_dynamo_kpi_args)
+    archive_data = archive_data.expand(source_data=validated_data)  
     
-    extract_data >> validated_data >> processed_data
-    processed_data >> [load_to_dynamo, archive_data] >> end
+    extract_data >> validated_data >> glue_job_args >> glue_jobs >> archive_data
+    [glue_job_args, glue_jobs]>> glue_job_kpi_args
+    glue_jobs_kpi >> load_to_dynamo_kpi_args
+    [glue_jobs_kpi, load_to_dynamo_kpi_args] >> load_to_dynamo
+    [ archive_data, load_to_dynamo] >> end
     
    
