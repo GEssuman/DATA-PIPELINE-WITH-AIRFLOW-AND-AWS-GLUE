@@ -1,6 +1,6 @@
 ## This code is part of a data pipeline that uses AWS Glue to process data. This dag will
 ## be trigered by an SQS message indicating that new data is availible in s3 bucket.
-
+import os
 from datetime import datetime
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -173,19 +173,90 @@ with DAG(
         return glue_args
 
 
+
+
+  
+
     @task
     def load_to_dynamo(job_kpi_args: dict):
+        import boto3
+        import pandas as pd
+        from io import StringIO
+        from urllib.parse import urlparse
+
+
         genre_stat = job_kpi_args['genre_stats']
         top_songs_per_genre = job_kpi_args['top_songs_per_genre']
 
-        try:
+        dynamodb = boto3.resource('dynamodb')
+        s3 = boto3.client('s3')
 
-            logging.info(f"Loading file from {genre_stat["input_path"]} into DynamoDB {genre_stat["table_name"]}")
-            logging.info(f"Loading file from {top_songs_per_genre["input_path"]} into DynamoDB {top_songs_per_genre["table_name"]}")
-        except Exception as e:
-            logging.error(f"Failed to load data into DynamoDB: {e}")
-            raise
-            
+        def is_s3_path(path):
+            return path.startswith("s3://")
+
+        def parse_s3_path(s3_path):
+            """Parse s3://bucket/key into (bucket, prefix)"""
+            parsed = urlparse(s3_path)
+            bucket = parsed.netloc
+            prefix = parsed.path.lstrip("/")
+            return bucket, prefix
+
+        def list_csv_files(input_path):
+            if is_s3_path(input_path):
+                bucket, prefix = parse_s3_path(input_path)
+                logging.info(f"Listing CSV files in s3://{bucket}/{prefix}")
+                response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+                if "Contents" not in response:
+                    raise FileNotFoundError(f"No files found at {input_path}")
+                return [
+                    f"s3://{bucket}/{obj['Key']}"
+                    for obj in response["Contents"]
+                    if obj["Key"].endswith(".csv")
+                ]
+            else:
+                return [os.path.join(input_path, f) for f in os.listdir(input_path) if f.endswith(".csv")]
+
+        def read_csv_files(input_path):
+            if input_path.endswith(".csv"):
+                return read_single_csv(input_path)
+            else:
+                files = list_csv_files(input_path)
+                if not files:
+                    raise FileNotFoundError(f"No CSV files found in {input_path}")
+                logging.info(f"Reading {len(files)} CSV files from {input_path}")
+                return pd.concat((read_single_csv(f) for f in files), ignore_index=True)
+
+        def read_single_csv(s3_path):
+            if is_s3_path(s3_path):
+                bucket, key = parse_s3_path(s3_path)
+                obj = s3.get_object(Bucket=bucket, Key=key)
+                return pd.read_csv(StringIO(obj['Body'].read().decode('utf-8')))
+            else:
+                with open(s3_path, "r") as f:
+                    return pd.read_csv(f)
+
+        def load_file_to_table(input_path, table_name):
+            try:
+                logging.info(f"📥 Loading data from {input_path} into DynamoDB table '{table_name}'")
+                df = read_csv_files(input_path)
+                table = dynamodb.Table(table_name)
+
+                count = 0
+                for _, row in df.iterrows():
+                    item = {k: str(v) if pd.notna(v) else None for k, v in row.to_dict().items()}
+                    table.put_item(Item=item)
+                    count += 1
+
+                logging.info(f"✅ Successfully loaded {count} items into '{table_name}'")
+            except Exception as e:
+                logging.error(f"❌ Failed to load data into DynamoDB table '{table_name}': {e}")
+                raise
+
+        # Load genre stats and top songs
+        load_file_to_table(genre_stat["input_path"], genre_stat["table_name"])
+        load_file_to_table(top_songs_per_genre["input_path"], top_songs_per_genre["table_name"])
+
+
 
     @task
     def archive_data(source_data: dict):
