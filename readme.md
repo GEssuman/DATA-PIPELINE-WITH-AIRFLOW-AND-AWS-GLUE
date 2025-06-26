@@ -24,7 +24,8 @@ https://docs.astronomer.io/astro/cli/install-cli
 
 Clone the repository: 
 ```bash 
-git clone https://github.com/your-org/music-streaming-pipeline.git cd music-streaming-pipeline
+git clone https://github.com/GEssuman/DATA-PIPELINE-WITH-AIRFLOW-AND-AWS-GLUE.git
+cd DATA-PIPELINE-WITH-AIRFLOW-AND-AWS-GLUE
 ```
 Start the Astro project: 
 ```bash 
