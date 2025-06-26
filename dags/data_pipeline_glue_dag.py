@@ -15,7 +15,7 @@ from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
 default_args = {
     'owner': 'Essuman',
     'depends_on_past': False,
-    'retries': 1,
+    'retries': 3,
     'retry_delay': 300,  # Retry delay in seconds
 }
 
@@ -47,7 +47,7 @@ with DAG(
 
         response = sqs.receive_message(
             QueueUrl=sqs_url,
-            MaxNumberOfMessages=10,
+            MaxNumberOfMessages=3,
             WaitTimeSeconds=20
         )
 
